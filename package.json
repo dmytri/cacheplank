@@ -29,8 +29,7 @@
     "prepublishOnly": "npm run build && npm test && npm run typecheck"
   },
   "dependencies": {
-    "@libsql/client": "^0.18.0",
-    "node": "^20.20.2"
+    "@libsql/client": "^0.18.0"
   },
   "peerDependencies": {
     "next": ">=16.0.0"
