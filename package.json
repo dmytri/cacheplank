@@ -1,0 +1,62 @@
+{
+  "name": "cacheplank",
+  "version": "0.1.0",
+  "description": "The shared plank your pods walk across: a single-file Next.js 16 cache handler where entries stay local and only tag invalidation is shared, via one libSQL table.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs && tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "prepublishOnly": "npm run build && npm test && npm run typecheck"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "node": "^20.20.2"
+  },
+  "peerDependencies": {
+    "next": ">=16.0.0"
+  },
+  "peerDependenciesMeta": {
+    "next": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "next": "16.3.8",
+    "typescript": "^5.6.0"
+  },
+  "keywords": [
+    "next",
+    "nextjs",
+    "next.js",
+    "cache-handler",
+    "cacheComponents",
+    "use-cache",
+    "isr",
+    "revalidateTag",
+    "libsql",
+    "turso",
+    "bunny"
+  ]
+}

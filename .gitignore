@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tgz
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.cache/
+tmp/
+.DS_Store
+.cptr/
