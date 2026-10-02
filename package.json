@@ -57,5 +57,12 @@
     "libsql",
     "turso",
     "bunny"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmytri/cacheplank.git"
+  }
 }

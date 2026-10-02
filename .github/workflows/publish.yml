@@ -1,0 +1,28 @@
+name: Publish
+
+# Trusted publishing (OIDC): no npm token secret. The package on npmjs.com
+# must list this workflow as a Trusted Publisher (user: dmytri, repo:
+# cacheplank, workflow: publish.yml). npm CLI >= 11.5.1 exchanges the GitHub
+# OIDC token for a short-lived publish grant; nothing secret to rotate.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write # OIDC — required for trusted publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14 # trusted publishing floor (CLI 11.5.1)
+          package-manager-cache: false # never cache in release builds
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm publish
