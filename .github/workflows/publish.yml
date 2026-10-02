@@ -1,9 +1,14 @@
 name: Publish
 
 # Trusted publishing (OIDC): no npm token secret. The package on npmjs.com
-# must list this workflow as a Trusted Publisher (user: dmytri, repo:
-# cacheplank, workflow: publish.yml). npm CLI >= 11.5.1 exchanges the GitHub
-# OIDC token for a short-lived publish grant; nothing secret to rotate.
+# lists this workflow as a Trusted Publisher (user: dmytri, repo: cacheplank,
+# workflow: publish.yml). npm CLI >= 11.5.1 exchanges the GitHub OIDC token
+# for a short-lived publish grant; nothing secret to rotate.
+#
+# Gotcha (actions/setup-node#1440): when NODE_AUTH_TOKEN is not set, older
+# setup-node versions write a placeholder token into .npmrc, which makes npm
+# skip OIDC and fail with ENEEDAUTH. setup-node@v6 + Node 24 + explicitly
+# unsetting NODE_AUTH_TOKEN before publish is the confirmed-working combo.
 on:
   push:
     tags:
@@ -17,12 +22,15 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22.14 # trusted publishing floor (CLI 11.5.1)
+          node-version: 24 # ships npm >= 11.5.1 with OIDC trusted publishing
+          registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false # never cache in release builds
       - run: npm ci
       - run: npm run build
       - run: npm test
-      - run: npm publish
+      - run: |
+          unset NODE_AUTH_TOKEN
+          npm publish

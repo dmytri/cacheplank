@@ -1,6 +1,6 @@
 {
   "name": "cacheplank",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The shared plank your pods walk across: a single-file Next.js 16 cache handler where entries stay local and only tag invalidation is shared, via one libSQL table.",
   "license": "MIT",
   "type": "commonjs",
