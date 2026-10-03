@@ -1,16 +1,30 @@
 /**
  * cacheplank — "the shared plank your pods walk across."
  *
- * A single-file, tag-based distributed cache handler for Next.js 16's
- * `cacheHandlers` API, backed by libSQL.
+ * A single-file, tag-based distributed cache handler for Next.js 16, backed by
+ * libSQL.
  *
  * Cache *entries* stay local to each process (an in-memory LRU). Only tag
  * *invalidation* is shared, through one tiny libSQL table (`tag_stamps`). Any
  * number of pods/regions converge because every `get` compares the entry's
  * timestamp against the shared invalidation stamps.
  *
- * Ground truth for the contract below: the installed `next@16.3.8` package —
+ * Two handlers, one invariant. Next 16 exposes two distinct, unrelated cache
+ * interfaces and resolves them from two different config keys:
+ *
+ *   1. `cacheHandlers` (plural) — a five-method API used for `"use cache"` /
+ *      fetch-path entries. cacheplank's `default` export implements this.
+ *   2. `cacheHandler` (singular) — the legacy incremental/ISR handler
+ *      (`get`/`set`/`revalidateTag`/`resetRequestCache`) that sits under
+ *      prerendered `APP_PAGE` / `APP_ROUTE` / `PAGES` routes and the fetch
+ *      cache. The `cacheplank/cache-handler` entry implements this.
+ *
+ * Both share the same `tag_stamps` table and the same convergence rule, so a
+ * `revalidateTag` from any pod invalidates both kinds of entry everywhere.
+ *
+ * Ground truth for the contracts below: the installed `next@16.3.8` package —
  * `dist/server/lib/cache-handlers/{types,default}.js`,
+ * `dist/server/lib/incremental-cache/{index,file-system-cache}.js`,
  * `dist/server/lib/incremental-cache/tags-manifest.external.js`, and
  * `dist/server/use-cache/{use-cache-wrapper,handlers}.js`. See README
  * "Compatibility notes".
@@ -18,8 +32,8 @@
 import { createClient, type Client } from '@libsql/client';
 
 /* ------------------------------------------------------------------------- *
- * Next 16 cache-handler contract.                                            *
- * Hand-written: Next does not export these types publicly (README note #1).  *
+ * Next 16 `cacheHandlers` (plural) contract — the five-method, `use cache` API.*
+ * Hand-written: Next does not export these types publicly (README note #1).   *
  * ------------------------------------------------------------------------- */
 
 /** A timestamp in milliseconds elapsed since the epoch. */
@@ -50,6 +64,53 @@ export interface CacheHandler {
   updateTags(tags: string[], durations?: { expire?: number }): Promise<void>;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Next 16 `cacheHandler` (singular) contract — the legacy incremental/ISR API. *
+ * Mirrors `CacheHandler`/`CacheHandlerValue` in                                *
+ * `next/dist/server/lib/incremental-cache/index.d.ts`. Values are opaque       *
+ * JSON-ish objects (Buffers/headers/segment maps); we never introspect them,   *
+ * only the tags they carry.                                                    *
+ * ------------------------------------------------------------------------- */
+
+/** Mirrors `GetIncremental*Context` (union) in next@16.3.8 — the fields we read. */
+export interface IncrementalCacheContext {
+  kind: string;
+  route?: string;
+  revalidate?: number;
+  /** Fetch-cache entry tags (only for `kind: 'FETCH'`). */
+  tags?: string[];
+  /** Route-path-derived tags Next passes for staleness checks. */
+  softTags?: string[];
+  fetchCache?: boolean;
+  isFallback?: boolean;
+  isRoutePPREnabled?: boolean;
+}
+
+/** A stored incremental value. Opaque to us beyond `kind` and any tags. */
+export interface IncrementalCacheValue {
+  kind: string;
+}
+
+/** Mirrors `CacheHandlerValue` in next@16.3.8. */
+export interface IncrementalCacheHandlerValue {
+  lastModified: number;
+  age?: number;
+  cacheState?: string;
+  value: IncrementalCacheValue | null;
+}
+
+/** Mirrors the singular `CacheHandler` class in next@16.3.8. */
+export interface IncrementalCacheHandler {
+  get(cacheKey: string, ctx: IncrementalCacheContext): Promise<IncrementalCacheHandlerValue | null>;
+  set(cacheKey: string, data: IncrementalCacheValue | null, ctx: IncrementalCacheContext): Promise<void>;
+  revalidateTag(tags: string | string[], durations?: { expire?: number }): Promise<void>;
+  resetRequestCache(): void;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Options.                                                                     *
+ * ------------------------------------------------------------------------- */
+
 export interface CacheplankOptions {
   /** libSQL URL. Defaults to `CACHEPLANK_URL`, then `BUNNY_DATABASE_URL`. */
   url?: string;
@@ -65,73 +126,103 @@ export interface CacheplankOptions {
    * Defaults to `CACHEPLANK_STAMPS_TTL_MS`, else 3000. [ms]
    */
   stampsTtlMs?: number;
+  /**
+   * Stamp retention window: stamps older than this are treated as inert and
+   * excluded from shared-table reads. Bounds the shared table to tags touched
+   * within the window. MUST be ≥ the app's longest entry lifetime (e.g. the
+   * longest `cacheLife` expire), else entries that outlive the window can
+   * resurrect stale. Defaults to `CACHEPLANK_STAMPS_RETENTION_MS`, else
+   * 30 days. [ms]
+   */
+  stampsRetentionMs?: number;
   /** Sink for the single fail-open warning. Defaults to `console.warn`. */
   warn?: (message: string) => void;
 }
 
-interface StoredEntry {
-  bytes: Uint8Array;
-  tags: string[];
-  timestamp: number;
-  expire: number;
-  revalidate: number;
-  stale: number;
-}
-
-/**
- * Soft TTL for the in-process tag-stamp memo. [ms]. Defaults to 3000; override
- * with `CACHEPLANK_STAMPS_TTL_MS` (e.g. `0` to read the shared table on every
- * `get`, which the cross-process test relies on).
- */
-const TAG_CHECK_TTL_MS = (() => {
-  const configured = Number(process.env.CACHEPLANK_STAMPS_TTL_MS);
-  return Number.isFinite(configured) && configured >= 0 ? configured : 3000;
-})();
 /** Fail-open backoff after a stamp-store error, so we don't hammer a dead DB. [ms] */
 const RETRY_BACKOFF_MS = 30_000;
 const DEFAULT_MAX_ENTRIES = 2000;
+/** Default soft TTL for the in-process tag-stamp memo. [ms] */
+const DEFAULT_STAMPS_TTL_MS = 3000;
+/**
+ * Default stamp retention window. Stamps older than this are ignored by
+ * shared-table reads, bounding the table to tags touched within the window.
+ * Generous enough to exceed any realistic max entry TTL (next's own `max`
+ * cacheLife profile is a year — apps using it should raise this).
+ * [ms]
+ */
+const DEFAULT_STAMPS_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 const now = (): number => Date.now();
 
+/** Trims an env value; returns its numeric value, or undefined if blank/invalid. */
+function envNumber(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+interface ResolvedOptions {
+  url?: string;
+  authToken?: string;
+  prefix: string;
+  maxEntries: number;
+  tagCheckTtlMs: number;
+  stampsRetentionMs: number;
+  warn: (message: string) => void;
+}
+
+function resolveOptions(options: CacheplankOptions): ResolvedOptions {
+  const configuredMax = envNumber('CACHEPLANK_MAX_ENTRIES');
+  const configuredTtl = envNumber('CACHEPLANK_STAMPS_TTL_MS');
+  const configuredRetention = envNumber('CACHEPLANK_STAMPS_RETENTION_MS');
+  return {
+    url: options.url ?? process.env.CACHEPLANK_URL ?? process.env.BUNNY_DATABASE_URL,
+    authToken:
+      options.authToken ?? process.env.CACHEPLANK_AUTH_TOKEN ?? process.env.BUNNY_DATABASE_AUTH_TOKEN,
+    prefix: options.prefix ?? process.env.CACHEPLANK_PREFIX ?? '',
+    // `>= 0` so `CACHEPLANK_MAX_ENTRIES=0` disables entry storage, mirroring
+    // next's own `maxSize === 0` no-op handler; blank/garbage falls back.
+    maxEntries:
+      options.maxEntries ??
+      (configuredMax !== undefined && configuredMax >= 0 ? configuredMax : DEFAULT_MAX_ENTRIES),
+    tagCheckTtlMs:
+      options.stampsTtlMs ??
+      (configuredTtl !== undefined && configuredTtl >= 0 ? configuredTtl : DEFAULT_STAMPS_TTL_MS),
+    // Window reads need a positive horizon; zero/blank/garbage → the default.
+    stampsRetentionMs:
+      options.stampsRetentionMs ??
+      (configuredRetention !== undefined && configuredRetention > 0
+        ? configuredRetention
+        : DEFAULT_STAMPS_RETENTION_MS),
+    warn: options.warn ?? ((message: string) => console.warn(`[cacheplank] ${message}`)),
+  };
+}
+
+/* ------------------------------------------------------------------------- *
+ * Shared tag-stamp store — the only shared state.                              *
+ * ------------------------------------------------------------------------- */
+
+interface StampStore {
+  /** Monotonic in-process memo of tag → latest invalidation timestamp. */
+  readonly stamps: Map<string, number>;
+  /** Refresh the memo from the shared table, respecting the soft TTL. */
+  sync(): Promise<void>;
+  /** Latest stamp across `tags` (0 if none seen). */
+  expiration(tags: string[]): Promise<Timestamp>;
+  /** Write a monotone stamp for every tag, and make it self-visible at once. */
+  update(tags: string[]): Promise<void>;
+}
+
 /**
- * Create a cache handler. The package's `default` export is one of these,
- * configured from the environment.
+ * One libSQL table holds invalidation stamps. Reads and writes are fail-open:
+ * a dead store degrades to process-local invalidation, never an exception.
  */
-export function createCacheHandler(options: CacheplankOptions = {}): CacheHandler {
-  const url = options.url ?? process.env.CACHEPLANK_URL ?? process.env.BUNNY_DATABASE_URL;
-  const authToken =
-    options.authToken ?? process.env.CACHEPLANK_AUTH_TOKEN ?? process.env.BUNNY_DATABASE_AUTH_TOKEN;
-  const prefix = options.prefix ?? process.env.CACHEPLANK_PREFIX ?? '';
-  const configuredMax = Number(process.env.CACHEPLANK_MAX_ENTRIES);
-  const maxEntries =
-    options.maxEntries ??
-    (Number.isFinite(configuredMax) && configuredMax > 0 ? configuredMax : DEFAULT_MAX_ENTRIES);
-  const configuredTtl = Number(process.env.CACHEPLANK_STAMPS_TTL_MS);
-  const tagCheckTtlMs =
-    options.stampsTtlMs ??
-    (Number.isFinite(configuredTtl) && configuredTtl >= 0 ? configuredTtl : TAG_CHECK_TTL_MS);
-  const warn = options.warn ?? ((message: string) => console.warn(`[cacheplank] ${message}`));
-
-  // ---- local entry store, LRU via Map insertion order ----
-  const entries = new Map<string, StoredEntry>();
-  function remember(key: string, entry: StoredEntry): void {
-    entries.delete(key);
-    entries.set(key, entry);
-    while (entries.size > maxEntries) {
-      const oldest = entries.keys().next().value;
-      if (oldest === undefined) break;
-      entries.delete(oldest);
-    }
-  }
-
-  // ---- shared tag stamps (in-process memo; monotonically increasing) ----
+function createStampStore(opts: ResolvedOptions): StampStore {
   const stamps = new Map<string, number>();
   let stampsSyncedAt = 0;
-  function observeStamp(tag: string, at: number): void {
-    if (at > (stamps.get(tag) ?? 0)) stamps.set(tag, at);
-  }
 
-  // ---- libSQL client: lazy, memoized, and never allowed to throw ----
   let client: Client | undefined;
   let ready: Promise<boolean> | undefined;
   let retryAt = 0;
@@ -139,22 +230,32 @@ export function createCacheHandler(options: CacheplankOptions = {}): CacheHandle
   function warnOnce(message: string): void {
     if (!warned) {
       warned = true;
-      warn(message);
+      opts.warn(message);
     }
+  }
+
+  function observe(tag: string, at: number): void {
+    if (at > (stamps.get(tag) ?? 0)) stamps.set(tag, at);
   }
 
   function ensureStore(): Promise<boolean> {
     if (ready) return ready;
-    if (!url) {
+    if (!opts.url) {
       warnOnce('no CACHEPLANK_URL / BUNNY_DATABASE_URL set; tag stamps are process-local only');
       return Promise.resolve(false);
     }
     if (now() < retryAt) return Promise.resolve(false);
     ready = (async () => {
       try {
-        const created = createClient({ url, authToken });
+        const created = createClient({ url: opts.url as string, authToken: opts.authToken });
         await created.execute(
           'CREATE TABLE IF NOT EXISTS tag_stamps (tag TEXT PRIMARY KEY, revalidated_at INTEGER NOT NULL)',
+        );
+        // Makes the retention-windowed sync read a range scan over live rows
+        // instead of a full-table scan (rows_read stays O(window), not
+        // O(every tag ever stamped)). Idempotent; rides the same lazy init.
+        await created.execute(
+          'CREATE INDEX IF NOT EXISTS tag_stamps_revalidated_at ON tag_stamps(revalidated_at)',
         );
         client = created;
         return true;
@@ -168,150 +269,47 @@ export function createCacheHandler(options: CacheplankOptions = {}): CacheHandle
     return ready;
   }
 
-  async function syncStamps(): Promise<void> {
-    if (now() - stampsSyncedAt < tagCheckTtlMs) return;
-    try {
-      if (!(await ensureStore()) || !client) return;
-      const result = await client.execute('SELECT tag, revalidated_at FROM tag_stamps');
-      for (const row of result.rows) {
-        const at = Number(row.revalidated_at);
-        if (Number.isFinite(at)) observeStamp(String(row.tag), at);
+  // Single-flight: one in-progress refresh; concurrent callers await it instead
+  // of each issuing their own full-table SELECT at a TTL boundary.
+  let syncing: Promise<void> | undefined;
+
+  function sync(): Promise<void> {
+    if (now() - stampsSyncedAt < opts.tagCheckTtlMs) return Promise.resolve();
+    if (syncing) return syncing;
+    // Claim the freshness window synchronously, so a burst of `get`s that all
+    // observe the expired memo together joins the one refresh below.
+    stampsSyncedAt = now();
+    syncing = (async () => {
+      try {
+        if (!(await ensureStore()) || !client) return;
+        // Retention window: stamps older than the window are provably inert
+        // (every entry they could invalidate has expired by then), so they are
+        // excluded here. That bounds memo size and read cost to tags touched
+        // within the window instead of every tag ever stamped, and keeps the
+        // range scan index-backed (see ensureStore).
+        const result = await client.execute({
+          sql: 'SELECT tag, revalidated_at FROM tag_stamps WHERE revalidated_at > ?',
+          args: [now() - opts.stampsRetentionMs],
+        });
+        for (const row of result.rows) {
+          const at = Number(row.revalidated_at);
+          if (Number.isFinite(at)) observe(String(row.tag), at);
+        }
+      } catch (error) {
+        retryAt = now() + RETRY_BACKOFF_MS;
+        warnOnce(`tag-stamp read failed; serving local state (${(error as Error).message})`);
+      } finally {
+        syncing = undefined;
       }
-    } catch (error) {
-      retryAt = now() + RETRY_BACKOFF_MS;
-      warnOnce(`tag-stamp read failed; serving local state (${(error as Error).message})`);
-    } finally {
-      stampsSyncedAt = now();
-    }
+    })();
+    return syncing;
   }
 
-  // In-flight `set` calls, so a `get` racing a `set` waits instead of missing.
-  const pendingSets = new Map<string, Promise<void>>();
-
   return {
-    async get(cacheKey, softTags) {
-      const key = prefix + cacheKey;
-      const pending = pendingSets.get(key);
-      if (pending) await pending.catch(() => {});
-
-      const entry = entries.get(key);
-      if (!entry) return undefined;
-
-      // Touch for LRU recency.
-      entries.delete(key);
-      entries.set(key, entry);
-
-      // A negative `expire` is the tiered-cache eviction sentinel Next's tiered
-      // handler uses in dev (the interface has no per-key delete); treat it as
-      // missing, independently of the retention bounds below.
-      if (entry.expire < 0) {
-        entries.delete(key);
-        return undefined;
-      }
-      // Mirror Next's effective expiry. `set` already dropped `expire: 0` in
-      // production. The wrapper discards an entry once
-      // `currentTime > timestamp + expire*1000` (always) or past `revalidate`
-      // during static generation; the default handler additionally drops past
-      // `revalidate` in production (SWR background revalidation then takes
-      // over). Dropping at either bound here matches what Next would reject
-      // anyway and never serves a value the wrapper throws away. In dev the
-      // default handler retains short-`expire` entries for at least
-      // MIN_PRERENDERABLE_EXPIRE (300s) so reloads hit; mirror that. A
-      // `revalidate <= 0` (including the stale-while-revalidate `-1`) drops.
-      const age = now() - entry.timestamp;
-      const maxAgeSeconds = process.env.__NEXT_DEV_SERVER
-        ? Math.max(entry.expire, 300)
-        : entry.revalidate;
-      if (!(age < maxAgeSeconds * 1000) || (entry.expire >= 0 && !(age < entry.expire * 1000))) {
-        return undefined;
-      }
-
-      // Shared invalidation: any tag (own or route soft tag) stamped at or
-      // after this entry was written means another pod revalidated it — miss,
-      // so Next regenerates. `>=` mirrors Next's wrapper-side discard
-      // (`entry.timestamp <= implicitTagsExpiration`): for an entry created in
-      // the same millisecond as a stamp the ordering is unknowable, so we
-      // conservatively regenerate.
-      await syncStamps();
-      for (const tag of entry.tags) {
-        if ((stamps.get(tag) ?? 0) >= entry.timestamp) return undefined;
-      }
-      for (const tag of softTags) {
-        if ((stamps.get(tag) ?? 0) >= entry.timestamp) return undefined;
-      }
-
-      const bytes = entry.bytes;
-      return {
-        value: new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(bytes);
-            controller.close();
-          },
-        }),
-        tags: entry.tags,
-        stale: entry.stale,
-        timestamp: entry.timestamp,
-        expire: entry.expire,
-        revalidate: entry.revalidate,
-      };
-    },
-
-    async set(cacheKey, pendingEntry) {
-      const key = prefix + cacheKey;
-      let release: () => void = () => {};
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      pendingSets.set(key, gate);
-      try {
-        const entry = await pendingEntry;
-        // In production an `expire: 0` entry is dynamic and never served back.
-        if (entry.expire === 0 && !process.env.__NEXT_DEV_SERVER) return;
-
-        const reader = entry.value.getReader();
-        const chunks: Uint8Array[] = [];
-        let size = 0;
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-              chunks.push(value);
-              size += value.byteLength;
-            }
-          }
-        } finally {
-          reader.releaseLock();
-        }
-        const bytes = new Uint8Array(size);
-        let offset = 0;
-        for (const chunk of chunks) {
-          bytes.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-
-        remember(key, {
-          bytes,
-          tags: entry.tags ?? [],
-          timestamp: entry.timestamp,
-          expire: entry.expire,
-          revalidate: entry.revalidate,
-          stale: entry.stale,
-        });
-      } catch (error) {
-        warnOnce(`failed to buffer a cache entry (${(error as Error).message})`);
-      } finally {
-        release();
-        pendingSets.delete(key);
-      }
-    },
-
-    async refreshTags() {
-      await syncStamps();
-    },
-
-    async getExpiration(tags) {
-      await syncStamps();
+    stamps,
+    sync,
+    async expiration(tags) {
+      await sync();
       let max = 0;
       for (const tag of tags) {
         const at = stamps.get(tag) ?? 0;
@@ -319,14 +317,9 @@ export function createCacheHandler(options: CacheplankOptions = {}): CacheHandle
       }
       return max;
     },
-
-    async updateTags(tags, _durations) {
-      // `durations.expire` is accepted but not persisted: the shared table holds
-      // a single monotone stamp per tag. A profile'd `revalidateTag` therefore
-      // invalidates immediately rather than stale-while-revalidate — safe, and
-      // faithful to the one-table model. See README compatibility note #4.
+    async update(tags) {
       const at = now();
-      for (const tag of tags) observeStamp(tag, at);
+      for (const tag of tags) observe(tag, at);
       if (tags.length === 0) return;
       try {
         if (!(await ensureStore()) || !client) return;
@@ -346,8 +339,296 @@ export function createCacheHandler(options: CacheplankOptions = {}): CacheHandle
   };
 }
 
+/** LRU insert via Map insertion order, capped at `max`. */
+function remember<V>(entries: Map<string, V>, key: string, value: V, max: number): void {
+  entries.delete(key);
+  entries.set(key, value);
+  while (entries.size > max) {
+    const oldest = entries.keys().next().value;
+    if (oldest === undefined) break;
+    entries.delete(oldest);
+  }
+}
+
+/** Extract the tag list a stored incremental value carries, if any. */
+function valueTags(value: IncrementalCacheValue | null): string[] {
+  if (!value) return [];
+  const tags = (value as { tags?: unknown }).tags;
+  if (Array.isArray(tags)) return tags.filter((t): t is string => typeof t === 'string');
+  const headers = (value as { headers?: Record<string, string | string[]> }).headers;
+  const header = headers?.['x-next-cache-tags'];
+  if (typeof header === 'string') return header.split(',');
+  return [];
+}
+
+/* ------------------------------------------------------------------------- *
+ * Handler 1 — `cacheHandlers` (plural). Entries are byte streams.              *
+ * ------------------------------------------------------------------------- */
+
+interface StoredEntry {
+  bytes: Uint8Array;
+  tags: string[];
+  timestamp: number;
+  expire: number;
+  revalidate: number;
+  stale: number;
+}
+
 /**
- * Default singleton. Next loads the module via `interopDefault`, so this
- * `default` export is the handler Next uses.
+ * Create a `cacheHandlers` (plural) handler. The package's `default` export is
+ * one of these, configured from the environment.
+ */
+export function createCacheHandler(options: CacheplankOptions = {}): CacheHandler {
+  const opts = resolveOptions(options);
+  const store = createStampStore(opts);
+
+  // Local entry store, LRU via Map insertion order.
+  const entries = new Map<string, StoredEntry>();
+  // In-flight `set` calls, so a `get` racing a `set` waits instead of missing.
+  const pendingSets = new Map<string, Promise<void>>();
+
+  return {
+    async get(cacheKey, softTags) {
+      const key = opts.prefix + cacheKey;
+      const pending = pendingSets.get(key);
+      if (pending) await pending.catch(() => {});
+
+      const entry = entries.get(key);
+      if (!entry) return undefined;
+
+      // Touch for LRU recency.
+      entries.delete(key);
+      entries.set(key, entry);
+
+      // A negative `expire` is a tombstone: dropped for good here rather than
+      // re-checked on every read (and independently of the retention bounds).
+      if (entry.expire < 0) {
+        entries.delete(key);
+        return undefined;
+      }
+      // Mirror Next's effective expiry. `set` already dropped `expire: 0` in
+      // production. The wrapper discards an entry once
+      // `currentTime > timestamp + expire*1000` (always) or past `revalidate`
+      // during static generation; the default handler additionally drops past
+      // `revalidate` in production (SWR background revalidation takes over).
+      // Dropping at either bound here matches what Next would reject anyway and
+      // never serves a value the wrapper throws away. In dev next widens the
+      // expire bound to MIN_PRERENDERABLE_EXPIRE (300s) — the default
+      // handler's single dev max-age and the wrapper's dev expire check use
+      // the same formula — so reloads of short-`expire` entries still hit; we
+      // widen the expire-bound check to match instead of only the max-age
+      // one. A `revalidate <= 0` (including SWR's `-1`) drops in production.
+      const age = now() - entry.timestamp;
+      const dev = Boolean(process.env.__NEXT_DEV_SERVER);
+      const maxAgeSeconds = dev ? Math.max(entry.expire, 300) : entry.revalidate;
+      const expireBoundSeconds = dev ? Math.max(entry.expire, 300) : entry.expire;
+      if (
+        !(age < maxAgeSeconds * 1000) ||
+        (entry.expire >= 0 && !(age < expireBoundSeconds * 1000))
+      ) {
+        return undefined;
+      }
+
+      // Shared invalidation: any tag (own or route soft tag) stamped at or
+      // after this entry was written means another pod revalidated it → miss,
+      // so Next regenerates. `>=` mirrors Next's own wrapper-side discard.
+      await store.sync();
+      for (const tag of entry.tags) {
+        if ((store.stamps.get(tag) ?? 0) >= entry.timestamp) return undefined;
+      }
+      for (const tag of softTags) {
+        if ((store.stamps.get(tag) ?? 0) >= entry.timestamp) return undefined;
+      }
+
+      const bytes = entry.bytes;
+      return {
+        value: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+        tags: entry.tags,
+        stale: entry.stale,
+        timestamp: entry.timestamp,
+        expire: entry.expire,
+        revalidate: entry.revalidate,
+      };
+    },
+
+    async set(cacheKey, pendingEntry) {
+      const key = opts.prefix + cacheKey;
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      pendingSets.set(key, gate);
+      try {
+        const entry = await pendingEntry;
+        // In production an `expire: 0` entry is dynamic and never served back.
+        if (entry.expire === 0 && !process.env.__NEXT_DEV_SERVER) return;
+
+        const bytes = await drainStream(entry.value);
+        remember(
+          entries,
+          key,
+          {
+            bytes,
+            tags: entry.tags ?? [],
+            timestamp: entry.timestamp,
+            expire: entry.expire,
+            revalidate: entry.revalidate,
+            stale: entry.stale,
+          },
+          opts.maxEntries,
+        );
+      } catch (error) {
+        opts.warn(`failed to buffer a cache entry (${(error as Error).message})`);
+      } finally {
+        release();
+        pendingSets.delete(key);
+      }
+    },
+
+    async refreshTags() {
+      await store.sync();
+    },
+
+    async getExpiration(tags) {
+      return store.expiration(tags);
+    },
+
+    async updateTags(tags, _durations) {
+      // `durations.expire` is accepted but not persisted: the shared table holds
+      // a single monotone stamp per tag. A profile'd `revalidateTag` therefore
+      // invalidates immediately rather than stale-while-revalidate — safe, and
+      // faithful to the one-table model. See README compatibility note #4.
+      await store.update(tags);
+    },
+  };
+}
+
+/* ------------------------------------------------------------------------- *
+ * Handler 2 — `cacheHandler` (singular). Entries are opaque JSON-ish values.   *
+ * ------------------------------------------------------------------------- */
+
+interface StoredIncrementalEntry {
+  lastModified: number;
+  value: IncrementalCacheValue;
+}
+
+/**
+ * Create a `cacheHandler` (singular, incremental/ISR) handler **class**.
+ *
+ * Next instantiates this class once per request (`new CurCacheHandler(ctx)` in
+ * `IncrementalCache`) and imports the module once, so all state lives in this
+ * closure — shared across the per-request instances by construction.
+ *
+ * Unlike the plural handler we do *not* re-implement time-based expiry: the
+ * incremental wrapper owns `revalidate`/`expire`/`isStale` semantics (it reads
+ * them from the prerender manifest's cache controls), so we implement exactly
+ * one policy — shared tag invalidation — and let Next decide everything else.
+ * That is what makes fully-static `APP_PAGE` routes converge across pods.
+ */
+export function createIncrementalCacheHandler(
+  options: CacheplankOptions = {},
+): new (ctx: unknown) => IncrementalCacheHandler {
+  const opts = resolveOptions(options);
+  const store = createStampStore(opts);
+  const entries = new Map<string, StoredIncrementalEntry>();
+
+  return class CacheplankIncrementalCacheHandler implements IncrementalCacheHandler {
+    // Next only ever passes its own context; we read none of it here (the
+    // meaningful context is supplied per call to `get`/`set`).
+    constructor(_ctx: unknown) {}
+
+    async get(cacheKey: string, ctx: IncrementalCacheContext) {
+      const key = opts.prefix + cacheKey;
+      const entry = entries.get(key);
+      if (!entry) return null;
+
+      // Touch for LRU recency.
+      entries.delete(key);
+      entries.set(key, entry);
+
+      // One shared rule, identical to the plural handler: a tag stamped at or
+      // after the entry was written means some pod revalidated it → miss, so
+      // Next regenerates (through the same response-cache path that wrote it).
+      await store.sync();
+      const tags = valueTags(entry.value);
+      if (ctx.tags) tags.push(...ctx.tags);
+      if (ctx.softTags) tags.push(...ctx.softTags);
+      for (const tag of tags) {
+        if ((store.stamps.get(tag) ?? 0) >= entry.lastModified) {
+          entries.delete(key);
+          return null;
+        }
+      }
+
+      return { lastModified: entry.lastModified, value: entry.value };
+    }
+
+    async set(
+      cacheKey: string,
+      data: IncrementalCacheValue | null,
+      _ctx: IncrementalCacheContext,
+    ) {
+      const key = opts.prefix + cacheKey;
+      // A null datum means "delete this key" (Next uses it to drop entries).
+      if (data == null) {
+        entries.delete(key);
+        return;
+      }
+      // The incremental values are plain objects (Buffers, headers, segment
+      // Maps) that Next does not mutate after writing, so we retain the
+      // reference — exactly like Next's own in-memory `FileSystemCache`. Only
+      // invalidation is shared; the entry itself never leaves this process.
+      remember(entries, key, { lastModified: now(), value: data }, opts.maxEntries);
+    }
+
+    async revalidateTag(tags: string | string[], _durations?: { expire?: number }) {
+      // Same table, same monotone upsert as the plural handler, so a
+      // `revalidateTag` invalidates both entry kinds across every pod.
+      await store.update(typeof tags === 'string' ? [tags] : tags);
+    }
+
+    resetRequestCache() {
+      // No per-request cache state to reset.
+    }
+  };
+}
+
+/* ------------------------------------------------------------------------- *
+ * Small helpers.                                                               *
+ * ------------------------------------------------------------------------- */
+
+async function drainStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        size += value.byteLength;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+/**
+ * Default singleton for the plural `cacheHandlers` API. Next loads the module
+ * via `interopDefault`, so this `default` export is the handler Next uses.
  */
 export default createCacheHandler();

@@ -2,16 +2,25 @@
 
 **The shared plank your pods walk across: one table of tag stamps, everything else stays local.**
 
-`cacheplank` is a single-file, tag-based distributed cache handler for Next.js 16's
-[`cacheHandlers`](https://nextjs.org/docs/app/api-reference/config/next-config-js/cacheHandlers)
-API, backed by [libSQL](https://github.com/tursodatabase/libsql).
+`cacheplank` is a single-file, tag-based distributed cache handler for Next.js 16,
+backed by [libSQL](https://github.com/tursodatabase/libsql).
+
+Next 16 has **two** pluggable cache interfaces, resolved from two different
+config keys. cacheplank implements **both**, so every kind of cached route
+converges across pods:
+
+| Config key | Interface | Serves | cacheplank entry |
+| --- | --- | --- | --- |
+| `cacheHandlers` (plural) | five-method `use cache` API | `"use cache"` results, fetch path | `cacheplank` (default export) |
+| `cacheHandler` (singular) | legacy incremental / ISR | prerendered **static** `APP_PAGE` / `APP_ROUTE` / `PAGES`, fetch cache | `cacheplank/cache-handler` (default export) |
 
 Cache **entries** stay local to each process (a plain in-memory LRU). Only tag
-**invalidation** is shared, through one tiny libSQL table (`tag_stamps`). Any
-number of pods or regions converge because every `get` compares the entry's
+**invalidation** is shared, through one tiny libSQL table (`tag_stamps`). Both
+handlers read and write that one table, so a `revalidateTag` from any pod
+invalidates every entry kind everywhere: every `get` compares the entry's
 timestamp against the shared invalidation stamps. That makes ISR/data-cache cost
 structurally low for self-hosted deploys: every regeneration is a local memory
-write, and the only durable write is a KB-scale tag-stamp upsert.
+write, and the only durable write is a one-row tag-stamp upsert.
 
 ## Quickstart
 
@@ -29,9 +38,12 @@ CACHEPLANK_AUTH_TOKEN=...
 // next.config.js  (CommonJS)
 module.exports = {
   cacheComponents: true,
+  // "use cache" / fetch path (the five-method API):
   cacheHandlers: {
     default: require.resolve('cacheplank'),
   },
+  // Prerendered static routes + ISR (the incremental/ISR API):
+  cacheHandler: require.resolve('cacheplank/cache-handler'),
 };
 ```
 
@@ -45,11 +57,22 @@ export default {
   cacheHandlers: {
     default: require.resolve('cacheplank'),
   },
+  cacheHandler: require.resolve('cacheplank/cache-handler'),
 };
 ```
 
-That's it. The package's `default` export is a ready-to-use handler configured
-from the environment.
+That's it. Each entry's `default` export is a ready-to-use handler configured
+from the environment. You can enable just one if you prefer — the two keys are
+independent — but you need **both** for fully-static pages to converge (see
+[Compatibility notes](#compatibility-notes) #6, and `npm run test:e2e`).
+
+> **Both handler paths must be absolute.** Next joins each config value against
+> the `.next/` directory (`formatDynamicImportPath(distDir, …)` in
+> `next-server.js`, called for `cacheHandlers` and `cacheHandler` alike), so a
+> relative `./cache-handler.cjs` resolves to `.next/cache-handler.cjs` and
+> throws `ERR_MODULE_NOT_FOUND` at startup. `require.resolve('cacheplank')` and
+> `require.resolve('cacheplank/cache-handler')` yield absolute paths and are the
+> recommended forms; plain absolute paths and `file://` URLs also work.
 
 ### Storage backends
 
@@ -71,9 +94,10 @@ fallbacks: `BUNNY_DATABASE_URL` and `BUNNY_DATABASE_AUTH_TOKEN`.
 | --- | --- | --- |
 | `CACHEPLANK_URL` | — | libSQL URL (falls back to `BUNNY_DATABASE_URL`) |
 | `CACHEPLANK_AUTH_TOKEN` | — | libSQL token (falls back to `BUNNY_DATABASE_AUTH_TOKEN`) |
-| `CACHEPLANK_PREFIX` | `''` | String prepended to every key (the only build/deploy escape hatch) |
-| `CACHEPLANK_MAX_ENTRIES` | `2000` | Local LRU capacity |
+| `CACHEPLANK_PREFIX` | `''` | String prepended to every cache key. Namespaces **entry keys only** — tag stamps are global, so configs sharing one DB cross-invalidate on identical tag strings |
+| `CACHEPLANK_MAX_ENTRIES` | `2000` | Local LRU capacity, **counted in entries, not bytes** — size it to your pod's memory; `0` disables entry storage |
 | `CACHEPLANK_STAMPS_TTL_MS` | `3000` | How long the in-process stamp memo is trusted |
+| `CACHEPLANK_STAMPS_RETENTION_MS` | `2592000000` (30d) | Stamp retention window: stamps older than this are ignored by shared-table reads, bounding the table and every sync to tags touched within the window. **Set it ≥ your longest entry lifetime** (longest `cacheLife` expire) — see below |
 
 The same options can be passed programmatically:
 
@@ -91,13 +115,39 @@ const handler = createCacheHandler({ url: process.env.CACHEPLANK_URL, prefix: 'p
 
 That is the design, not a shortcut. Two pods will each render and each hold their
 own copy; what they agree on is *what is stale*, not *what is cached*. In
-exchange, the shared state is one KB-scale table, and a cold pod simply
-regenerates locally instead of paying a network round-trip for every read.
+exchange, the shared state is one small table (≈48 bytes per distinct tag ever
+revalidated), and a cold pod simply regenerates locally instead of paying a
+network round-trip for every read.
 
-The handler is **fail-open**: if the database is unreachable, `get` still serves
-valid local entries, and `updateTags` / `refreshTags` resolve without throwing
-(after logging exactly one warning). cacheplank never throws into Next's request
-path.
+The handlers are **fail-open**: if the database is unreachable, `get` still
+serves valid local entries, and `updateTags` / `refreshTags` / `revalidateTag`
+resolve without throwing (after logging exactly one warning). cacheplank never
+throws into Next's request path.
+
+There is a **bounded convergence window**: a pod's in-process view of
+invalidation is refreshed from the shared table at most every
+`CACHEPLANK_STAMPS_TTL_MS` (default 3s). A pod therefore converges on another
+pod's `revalidateTag` within that window, not instantaneously. Set the env var to
+`0` to consult the shared table on every read. Once the memo expires,
+concurrent reads coalesce into a single windowed query (single-flight
+refresh), so a read burst costs one stamp query per handler instance per
+window. That query only reads stamps **inside the retention window**
+(`CACHEPLANK_STAMPS_RETENTION_MS`, default 30 days) via an auto-provisioned
+index on the stamp age — so sync cost and memo size track the tags *touched
+recently*, not every tag ever stamped. Rows are never deleted; they simply age
+out of the window (a 48-byte row that nothing reads costs disk alone).
+
+**The retention window is a correctness knob, not a tuning knob.** A stamp
+guards entries written before it, and entries die at `timestamp + expire`;
+so a stamp is provably inert once older than the app's longest entry
+lifetime. Keep `CACHEPLANK_STAMPS_RETENTION_MS` ≥ your longest `cacheLife`
+expire, or entries that outlive the window (including no-expiry static
+pages) can resurrect stale after the window passes.
+
+After a **database error** (as opposed to the URL merely being unset), the pod
+backs off 30s before retrying the store — fail-open recovery can therefore lag
+the configured `CACHEPLANK_STAMPS_TTL_MS` by that much. With no URL configured
+at all, the handler warns once and stays process-local permanently.
 
 ## Invariants (the compatibility contract)
 
@@ -115,14 +165,29 @@ the thing npm actually ships:
 6. Expiry mirrors Next's own bounds: an entry is a miss past `revalidate` **or**
    past `expire` (the wrapper discards on either), `expire < 0` is the tiered-cache
    eviction sentinel → miss, and `expire === 0` is dynamic and not stored in
-   production.
+   production. In dev (when `__NEXT_DEV_SERVER` is set) both bounds widen to
+   `MIN_PRERENDERABLE_EXPIRE` (300s), matching next's own dev retention, and
+   `CACHEPLANK_MAX_ENTRIES=0` disables entry storage (next's `maxSize: 0`
+   semantics).
+7. Stamp refreshes are single-flight: however many reads observe an expired
+   memo together, exactly one shared-table query is issued per handler
+   instance, and the rest await its result.
 
-Plus a cross-process fixture: two real child processes, one on-disk `file:` DB,
-a stamp written by one observed by the other. Run everything with:
+The same invariants are enforced for **both** handlers (the plural
+`cacheHandlers` and the singular `cacheHandler`), plus a cross-process fixture:
+two real child processes, one on-disk `file:` DB, a stamp written by one observed
+by the other. Run everything with:
 
 ```sh
-npm run build && npm test
+npm run build && npm test && npm run test:e2e
 ```
+
+`npm run test:e2e` is the end-to-end proof of the issue that motivated the
+singular handler: it builds a real `next` app with a **fully-static** route,
+copies it into two independent pods (separate `.next`, separate memory, sharing
+only the stamp DB), and asserts that pod B converges on pod A's
+`revalidateTag`. Run it with `WITH_SINGULAR=0` for the control — without the
+singular handler, pod B does not converge.
 
 ## Compatibility notes
 
@@ -155,6 +220,25 @@ package's source (code is truth, prose isn't):
 5. **The default handler is the reference.** Next's in-memory handler is
    `dist/server/lib/cache-handlers/default.js`; cacheplank's expiry logic and its
    negative-`expire` / `expire === 0` handling are mirrored from it deliberately.
+6. **There are two cache-handler interfaces, not one.** Next resolves
+   `cacheHandlers` (plural, five-method) and `cacheHandler` (singular, legacy
+   incremental/ISR) independently — `next-server.js` imports both, and
+   `IncrementalCache` constructs the singular one with `new`. A fully-static
+   prerendered route never touches the plural handler; it is served through the
+   singular incremental cache (or, with no handler configured, a pod-local
+   on-disk `route-cache`). **A singular `cacheHandler` makes Next bypass that
+   on-disk file and consult the handler for every request**, which is what lets
+   static routes converge. cacheplank ships both entries off one shared table.
+   The singular path is resolved against `.next/`, so it must be absolute.
+7. **The singular handler is instantiated per request.** `IncrementalCache` does
+   `new CurCacheHandler(ctx)` for each request while the module itself is
+   imported once, so cacheplank keeps all singular-handler state (the entry LRU
+   and the stamp memo) in a module-level closure — shared across those
+   instances. Singular entries are opaque values (Buffers, headers, segment
+   `Map`s); cacheplank retains the object by reference, exactly like Next's own
+   in-memory `FileSystemCache`. Time-based `revalidate` / `expire` / `isStale`
+   semantics are owned by the wrapper, not the handler, so the singular handler
+   implements exactly one policy: shared tag invalidation.
 
 ## License
 

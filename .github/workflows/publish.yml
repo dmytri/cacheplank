@@ -30,7 +30,11 @@ jobs:
           package-manager-cache: false # never cache in release builds
       - run: npm ci
       - run: npm run build
+      # Gate the artifact on the same checks CI ran pre-merge (typecheck via
+      # prepublishOnly, plus both convergence scenarios).
       - run: npm test
+      - run: npm run test:e2e
+      - run: WITH_SINGULAR=0 npm run test:e2e
       - run: |
           unset NODE_AUTH_TOKEN
           npm publish

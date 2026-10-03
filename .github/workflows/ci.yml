@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22']
+        node: ['20', '22', '24']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,3 +23,7 @@ jobs:
       - run: npm run build
       - run: npm test
       - run: npm run typecheck
+      # The e2e pair is the causal proof for the singular handler: with it,
+      # pod B converges; without it (control), it must not.
+      - run: npm run test:e2e
+      - run: WITH_SINGULAR=0 npm run test:e2e
