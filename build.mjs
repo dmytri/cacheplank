@@ -3,7 +3,7 @@
 import { build } from 'esbuild';
 
 const shared = {
-  entryPoints: ['src/index.ts', 'src/cache-handler.ts'],
+  entryPoints: ['src/index.ts', 'src/cache-handler.ts', 'src/middleware.ts'],
   bundle: true,
   platform: 'node',
   target: 'node20',

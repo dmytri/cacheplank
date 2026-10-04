@@ -51,7 +51,14 @@ function writeApp(appDir) {
   writeFileSync(
     path.join(appDir, 'next.config.mjs'),
     `const dist = ${JSON.stringify(dist)};
-const config = { cacheComponents: false, cacheHandlers: { default: dist + '/index.cjs' } };
+const repo = ${JSON.stringify(repo)};
+const config = {
+  cacheComponents: false,
+  cacheHandlers: { default: dist + '/index.cjs' },
+  // Turbopack only resolves files under its workspace root; the middleware
+  // shim imports the built handler from the repo's dist/, so root = repo.
+  turbopack: { root: repo },
+};
 ${WITH_SINGULAR ? "config.cacheHandler = dist + '/cache-handler.cjs';" : ''}
 export default config;
 `,
@@ -59,6 +66,37 @@ export default config;
   writeFileSync(
     path.join(appDir, 'package.json'),
     JSON.stringify({ name: 'cacheplank-e2e', private: true, type: 'module' }),
+  );
+  // Middleware answering conditionals from shared fingerprints (current
+  // generation only; pass-through otherwise). Next bundles middleware and
+  // rejects absolute-path imports, so the app gets a shim that imports the
+  // package by name (resolved from the repo's node_modules) — same trick the
+  // cacheHandler config uses with require.resolve.
+  mkdirSync(path.join(appDir, 'node_modules', 'cacheplank-e2e-shim'), { recursive: true });
+  writeFileSync(
+    path.join(appDir, 'node_modules', 'cacheplank-e2e-shim', 'package.json'),
+    JSON.stringify({
+      name: 'cacheplank-e2e-shim',
+      version: '0.0.0',
+      type: 'module',
+      exports: './shim.mjs',
+    }),
+  );
+  writeFileSync(
+    path.join(appDir, 'node_modules', 'cacheplank-e2e-shim', 'shim.mjs'),
+    // Relative import from the shim up to the repo dist — turbopack resolves
+    // relative specifiers under its configured root (repo, see next.config).
+    `import handler, { withConditional304 } from '../../../../../dist/middleware.mjs';
+export { withConditional304 };
+export default handler;
+`,
+  );
+  writeFileSync(
+    path.join(appDir, 'middleware.js'),
+    `import handler from 'cacheplank-e2e-shim';
+export default handler;
+export const config = { matcher: ['/:path*'], runtime: 'nodejs' };
+`,
   );
   writeFileSync(
     path.join(appDir, 'app', 'layout.js'),
@@ -100,12 +138,13 @@ function start(cwd, port, logFile) {
     cwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true, // `next start` spawns a next-server child; kill the group.
   });
-  const sink = [];
-  child.stdout.on('data', (d) => sink.push(d));
-  child.stderr.on('data', (d) => sink.push(d));
+  const tag = path.basename(cwd);
+  child.stdout.on('data', (d) => process.stdout.write(`[${tag}] ${d}`));
+  child.stderr.on('data', (d) => process.stderr.write(`[${tag}] ${d}`));
   child.on('exit', (code) => {
-    if (!stopping) log(`pod on ${port} exited early (${code}):\n${Buffer.concat(sink)}`);
+    if (!stopping) log(`pod on ${port} exited early (${code})`);
   });
   return child;
 }
@@ -114,7 +153,13 @@ let stopping = false;
 const pods = [];
 function stopAll() {
   stopping = true;
-  for (const child of pods) child.kill('SIGKILL');
+  for (const child of pods) {
+    try {
+      process.kill(-child.pid, 'SIGKILL'); // negative pid = the whole group
+    } catch {
+      /* already gone */
+    }
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -163,6 +208,8 @@ try {
     cpSync(path.join(appDir, 'app'), path.join(dir, 'app'), { recursive: true });
     cpSync(path.join(appDir, 'next.config.mjs'), path.join(dir, 'next.config.mjs'));
     cpSync(path.join(appDir, 'package.json'), path.join(dir, 'package.json'));
+    cpSync(path.join(appDir, 'middleware.js'), path.join(dir, 'middleware.js'));
+    cpSync(path.join(appDir, 'node_modules'), path.join(dir, 'node_modules'), { recursive: true });
   }
 
   // 3. Start both pods.
@@ -195,6 +242,45 @@ try {
   if (WITH_SINGULAR) {
     if (b2 !== 'V2') fail(`pod B did not converge (expected V2, got ${b2})`);
     log('\n✓ static-route cross-pod convergence: OK');
+
+    // 6. Fingerprint scenario: pod B answers the CDN-style conditional with
+    // 304 WITHOUT rendering. Pod A has rendered V2 (step 5) and published its
+    // fingerprint. Ask POD B with If-None-Match: etag-of-A's-V2.
+    const htmlA = await (await fetch(`http://127.0.0.1:${PORT_A}/`)).text();
+    // Next's send-layer etag: FNV-1a over the exact payload bytes. Extract
+    // the page payload the way Next would (full response body for a static
+    // page IS the payload).
+    const { generateETag } = await import(
+      path.join(repo, 'node_modules', 'next', 'dist', 'server', 'lib', 'etag.js')
+    );
+    const etagV2 = generateETag(htmlA);
+    const conditional = await fetch(`http://127.0.0.1:${PORT_B}/`, {
+      headers: { 'if-none-match': etagV2 },
+    });
+    log(`6. conditional (If-None-Match: ${etagV2}) on POD B → ${conditional.status}`);
+    if (conditional.status === 304) {
+      log('✓ pod B answered 304 from the shared fingerprint — no render needed');
+    } else {
+      // Not fatal-but-report: middleware may legitimately pass through (e.g.
+      // middleware matcher skipped, or generation superseded). Distinguish:
+      const body = await conditional.text();
+      log(`   … got ${conditional.status} (body has value ${body.match(/id="value">([^<]*)/)?.[1]}).`);
+      log('   ✗ fingerprint 304 did not happen');
+      fail('expected pod B to answer 304 from the shared fingerprint');
+    }
+
+    // 7. Attribution: after ANOTHER revalidation the old etag must stop
+    // answering (generation bumped, fingerprint retired).
+    await fetch(`http://127.0.0.1:${PORT_A}/api/revalidate`);
+    await sleep(STAMP_TTL_MS + 1500);
+    const staleConditional = await fetch(`http://127.0.0.1:${PORT_B}/`, {
+      headers: { 'if-none-match': etagV2 },
+    });
+    log(`7. same conditional after re-revalidation → ${staleConditional.status}`);
+    if (staleConditional.status === 304) {
+      fail('superseded fingerprint answered 304 — generation check is broken');
+    }
+    log('✓ superseded fingerprint no longer answers: OK');
   } else {
     if (b2 === 'V2') fail('pod B converged even without the singular handler — control is invalid');
     log('\n✓ control (no singular handler): pod B correctly did NOT converge');
@@ -206,5 +292,5 @@ try {
   }
 } finally {
   stopAll();
-  rmSync(root, { recursive: true, force: true });
+  // rmSync disabled for debugging
 }

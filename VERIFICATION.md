@@ -1,3 +1,78 @@
+# cacheplank 0.1.5 — verification report (shared fingerprints / 304 answering)
+
+Resolves the redundant-regen question from the design discussion: after an
+invalidation, sibling pods re-rendered identical payloads because "what is
+cached" is process-local. 0.1.5 shares the *minimum fact* that fixes the
+CDN-facing case — not content, not leases: the **etag of the current
+generation**.
+
+## What changed
+
+| Change | Detail |
+| --- | --- |
+| `route_fingerprints` table | `{path PK, generation, etag, published_at}`; created lazily in `ensureStore` alongside the stamps table. Retention-windowed on `published_at` (wall clock — generations are stamp epochs, not ages). |
+| Publish on singular `set` | `APP_PAGE` values publish `{path, generation = stamp of `_N_T_<path>` at render time, etag = FNV-1a over the html payload}`. ETag algorithm is a verified port of next's `lib/etag.js` (identical output on ASCII/unicode/astral/10KB samples). |
+| Route-path derivation | Next strips `ctx.route` for non-FETCH kinds; the path comes from the storage key's trailing segment (`/route-cache/APP_PAGE/<sha256(owner)>/$/<path>`), with `/index` normalized to `/` (next's implicit-tag aliasing) so the soft-tag generation matches what `revalidateTag` bumps. |
+| `resolveConditional(pathname, ifNoneMatch, options)` | Returns `304` iff a fingerprint exists for the path, its `generation >= ` the route's current generation (the same sync'd `_N_T_` stamp memo the handlers use), it is inside the retention window, and the etag matches. Otherwise `null` (render as usual). |
+| `withConditional304(options)` / `cacheplank/middleware` entry | Next middleware (Node runtime — proxy files always run on Node) that answers matching conditionals with a bare 304 pre-render and passes everything else through. Fail-open: any store error → normal render path. |
+
+## Safety invariants (the "can a fingerprint bless stale content?" question)
+
+1. **Generation guard**: `revalidateTag('_N_T_/<path>')` bumps the route stamp;
+   `resolveConditional` requires `row.generation >= stamp`. Any invalidation
+   retires the fleet's fingerprints for that path *instantly* (each pod's memo
+   absorbs the stamp on its next sync, ≤ TTL window).
+2. **Retention guard**: fingerprints older than `CACHEPLANK_STAMPS_RETENTION_MS`
+   are invisible, exactly like stamps — a row cannot outlive the correctness
+   argument that retired stamps use.
+3. **Monotone publish**: the upsert only overwrites when
+   `excluded.generation >= existing.generation` — a lagging pod cannot regress
+   the table to an older generation.
+4. **No-content sharing**: the row is `{path, generation, etag, published_at}`
+   — no bytes cross pods, ever.
+
+## Verified end-to-end (two real pods, one `file:` DB, real `next` app)
+
+```
+1-4. warm both pods (V1) → change source value → revalidateTag via pod A
+5.   after stamp-memo TTL:        A=V2 B=V2        (existing convergence proof)
+6.   conditional (If-None-Match: etag-of-V2) on POD B → 304
+     ✓ pod B answered from the shared fingerprint — no render
+7.   revalidateTag again → same conditional on POD B → 200
+     ✓ superseded fingerprint no longer answers (generation guard)
+```
+
+`WITH_SINGULAR=0` control: no fingerprints are published (publish lives in the
+singular `set`), pod B does not converge — unchanged from 0.1.4.
+
+Also fixed while wiring the e2e: pods are now spawned detached and stopped via
+process-group kill — `next start`'s server child previously survived the CLI's
+SIGKILL and kept the ports bound, poisoning subsequent runs.
+
+## Cost
+
+- Steady-state reads: unchanged (fingerprint consulted only on the miss path;
+  the middleware lookup rides the same single-flight sync'd memo).
+- Regen path: one extra ~50-byte row write per rendered route generation.
+- Sync payload: fingerprint rows flow through the same retention-windowed
+  read (rows_read stays O(live window)); `route_fingerprints` is keyed by
+  path, so its size is bounded by routes-touched-in-window.
+- Failure mode of the feature (etag mismatch, no row yet): falls through to
+  the exact 0.1.4 behavior — never worse.
+
+## Matrix (all green on 0.1.5 build, Node 24.21)
+
+| Check | Result |
+| --- | --- |
+| `npm run build` (now 3 entries: index, cache-handler, middleware) | pass |
+| `npm test` — 21 tests | 21/21 pass |
+| `npm run typecheck` | pass |
+| `node test/two-process.mjs` | pass |
+| `npm run test:e2e` — convergence + fingerprint 304 + superseded guard | pass |
+| `WITH_SINGULAR=0 npm run test:e2e` | pass (control) |
+
+---
+
 # cacheplank 0.1.4 — verification report (stamp retention window)
 
 Resolves the last open item from the growth discussion: the shared-table read

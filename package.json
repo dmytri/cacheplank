@@ -1,6 +1,6 @@
 {
   "name": "cacheplank",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "The shared plank your pods walk across: a single-file Next.js 16 cache handler where entries stay local and only tag invalidation is shared, via one libSQL table.",
   "license": "MIT",
   "type": "commonjs",
@@ -17,6 +17,11 @@
       "types": "./dist/cache-handler.d.ts",
       "import": "./dist/cache-handler.mjs",
       "require": "./dist/cache-handler.cjs"
+    },
+    "./middleware": {
+      "types": "./dist/middleware.d.ts",
+      "import": "./dist/middleware.mjs",
+      "require": "./dist/middleware.cjs"
     }
   },
   "files": [

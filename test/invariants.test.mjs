@@ -237,6 +237,79 @@ test('8: CACHEPLANK_MAX_ENTRIES=0 disables caching; an empty value falls back to
   }
 });
 
+test('10: fingerprints — singular set publishes; resolveConditional answers only current generation + matching etag', async (t) => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'cacheplank-fingerprint-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const url = `file:${path.join(dir, 'fp.db')}`;
+
+  const { createIncrementalCacheHandler, resolveConditional } = await import('../dist/index.mjs');
+  const Singular = createIncrementalCacheHandler({ url, prefix: 'p', warn: () => {} });
+  const podA = new Singular({});
+
+  // Pod A renders and stores an APP_PAGE for the route. This must publish a
+  // fingerprint row {path → (generation, etag)} derived from the route's
+  // soft tag stamp and the payload bytes. (Next's serialized APP_PAGE value
+  // carries html as a string — IncrementalCachedAppPageValue.)
+  const payload = '<html>V1</html>';
+  await podA.set('/APP_PAGE/route', { kind: 'APP_PAGE', html: payload }, {
+    kind: 'APP_PAGE',
+    route: '/product',
+    softTags: ['_N_T_/product'],
+  });
+
+  // Etag of the payload, Next's own algorithm (FNV-1a per lib/etag.js).
+  const { generateETag } = await import('../node_modules/next/dist/server/lib/etag.js');
+  const etagV1 = generateETag(payload);
+
+  // 10a: matching etag at current generation → 304, no regen needed.
+  const hit = await resolveConditional('/product', etagV1, { url, prefix: 'p', warn: () => {} });
+  assert.equal(hit, 304, 'matching etag at current generation → 304');
+
+  // 10b: unknown path → null (render as usual).
+  assert.equal(
+    await resolveConditional('/other', etagV1, { url, prefix: 'p', warn: () => {} }),
+    null,
+    'no fingerprint for path → null',
+  );
+
+  // 10c: wrong etag (requester holds an older generation) → null.
+  assert.equal(
+    await resolveConditional('/product', '"stale-etag"', { url, prefix: 'p', warn: () => {} }),
+    null,
+    'etag mismatch → null',
+  );
+
+  // 10d: after revalidation bumps the route's generation, the OLD etag must
+  // no longer 304 — the world moved on; only a fingerprint from the new
+  // generation may answer.
+  await podA.revalidateTag('_N_T_/product');
+  assert.equal(
+    await resolveConditional('/product', etagV1, { url, prefix: 'p', warn: () => {} }),
+    null,
+    'fingerprint from a superseded generation must not answer',
+  );
+
+  // 10e: pod A re-renders post-invalidation → new fingerprint → new etag answers.
+  const payloadV2 = '<html>V2</html>';
+  await podA.set('/APP_PAGE/route', { kind: 'APP_PAGE', html: payloadV2 }, {
+    kind: 'APP_PAGE',
+    route: '/product',
+    softTags: ['_N_T_/product'],
+  });
+  const etagV2 = generateETag(payloadV2);
+  assert.equal(
+    await resolveConditional('/product', etagV2, { url, prefix: 'p', warn: () => {} }),
+    304,
+    'fingerprint from the new generation answers 304',
+  );
+  // …and the pre-invalidation etag still must not.
+  assert.equal(
+    await resolveConditional('/product', etagV1, { url, prefix: 'p', warn: () => {} }),
+    null,
+    'old etag stays dead after regeneration',
+  );
+});
+
 test('9: stamps older than the retention window are invisible; fresh stamps invalidate; index is provisioned', async (t) => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'cacheplank-retention-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

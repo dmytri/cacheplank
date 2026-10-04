@@ -74,6 +74,43 @@ independent — but you need **both** for fully-static pages to converge (see
 > `require.resolve('cacheplank/cache-handler')` yield absolute paths and are the
 > recommended forms; plain absolute paths and `file://` URLs also work.
 
+### Optional: 304 answers from shared fingerprints (`cacheplank/middleware`)
+
+When a pod re-renders a fully-static route, it also publishes a tiny
+**fingerprint** row — `{ path, generation, etag }` — to the shared table
+(`route_fingerprints`, same retention window as stamps). A `middleware.ts`
+using `cacheplank/middleware` answers conditional requests whose
+`If-None-Match` matches the **current generation's** published etag with
+**304** — before Next renders anything. The classic case: pod A regenerated,
+the CDN holds A's etag, and the CDN's revalidation lands on pod B — B answers
+304 from the table instead of re-rendering the identical page.
+
+```js
+// middleware.ts  (Next 16: the file may also be named `proxy.js`)
+import { withConditional304 } from 'cacheplank/middleware';
+
+export default withConditional304();          // or withConditional304(options)
+export const config = { matcher: ['/:path*'] };
+```
+
+Facts worth knowing:
+
+- **What is shared is metadata, never content**: a 48-byte row per route
+  generation. Entries stay process-local as always.
+- **A 304 is only ever answered for the current generation.** Any
+  `revalidateTag` bumps the route's soft-tag stamp (`_N_T_<path>`) and
+  instantly retires the old fingerprint on every pod — a stale etag can never
+  bless stale content. Rows age out with `CACHEPLANK_STAMPS_RETENTION_MS`
+  like stamps.
+- **Fingerprints are published for `APP_PAGE` values** (fully-static/ISR
+  HTML). `use cache`/RSC segment payloads have no single etag-able body and
+  are not fingerprinted.
+- ETags are computed with Next's own algorithm (`lib/etag.js` FNV-1a over the
+  payload), so published etags match what Next's send layer computes for the
+  same bytes.
+- Without this middleware nothing changes: the handlers behave exactly as
+  before, and every conditional falls through to the normal render path.
+
 ### Storage backends
 
 Any libSQL URL scheme works — the table is created lazily on first use.

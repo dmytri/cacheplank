@@ -213,6 +213,19 @@ interface StampStore {
   expiration(tags: string[]): Promise<Timestamp>;
   /** Write a monotone stamp for every tag, and make it self-visible at once. */
   update(tags: string[]): Promise<void>;
+  /**
+   * Record the fingerprint of a freshly rendered route: `generation` is the
+   * route soft-tag stamp at publish time, `etag` hashes the stored payload.
+   * Monotone on generation (never regress), fail-open like every write.
+   */
+  publishFingerprint(path: string, generation: number, etag: string): Promise<void>;
+  /**
+   * Fingerprint for `path`, or undefined. Only rows from a generation ≥
+   * `minGeneration` (the caller's view of the route's current generation) and
+   * within the retention window are returned — older ones are provably
+   * superseded.
+   */
+  fingerprint(path: string, minGeneration: number): Promise<string | undefined>;
 }
 
 /**
@@ -256,6 +269,18 @@ function createStampStore(opts: ResolvedOptions): StampStore {
         // O(every tag ever stamped)). Idempotent; rides the same lazy init.
         await created.execute(
           'CREATE INDEX IF NOT EXISTS tag_stamps_revalidated_at ON tag_stamps(revalidated_at)',
+        );
+        // Route fingerprints: per-path record of the latest generation's
+        // rendered etag, so a sibling pod's middleware can answer a
+        // conditional request (If-None-Match) with 304 without rendering.
+        // `generation` is the route soft-tag stamp at publish time;
+        // `published_at` is wall-clock (used for retention filtering —
+        // generations are stamp epochs, not ages). Rows age out with the
+        // same retention window as stamps.
+        await created.execute(
+          'CREATE TABLE IF NOT EXISTS route_fingerprints (' +
+            'path TEXT PRIMARY KEY, generation INTEGER NOT NULL, ' +
+            'etag TEXT NOT NULL, published_at INTEGER NOT NULL)',
         );
         client = created;
         return true;
@@ -336,6 +361,42 @@ function createStampStore(opts: ResolvedOptions): StampStore {
         warnOnce(`tag-stamp write failed; local state kept (${(error as Error).message})`);
       }
     },
+
+    async publishFingerprint(path, generation, etag) {
+      try {
+        if (!(await ensureStore()) || !client) return;
+        await client.execute({
+          sql:
+            'INSERT INTO route_fingerprints(path, generation, etag, published_at) VALUES (?, ?, ?, ?) ' +
+            'ON CONFLICT(path) DO UPDATE SET ' +
+            'generation = excluded.generation, etag = excluded.etag, published_at = excluded.published_at ' +
+            'WHERE excluded.generation >= route_fingerprints.generation',
+          args: [path, generation, etag, now()],
+        });
+      } catch (error) {
+        warnOnce(`fingerprint write failed; conditional answers may re-render (${(error as Error).message})`);
+      }
+    },
+
+    async fingerprint(path, minGeneration) {
+      try {
+        if (!(await ensureStore()) || !client) return undefined;
+        // Retention on published_at (wall clock); generation check is the
+        // freshness rule: a fingerprint from a superseded generation must
+        // never answer (see resolveConditional).
+        const result = await client.execute({
+          sql:
+            'SELECT etag FROM route_fingerprints ' +
+            'WHERE path = ? AND generation >= ? AND published_at > ?',
+          args: [path, minGeneration, now() - opts.stampsRetentionMs],
+        });
+        const row = result.rows[0];
+        return row ? String(row.etag) : undefined;
+      } catch (error) {
+        warnOnce(`fingerprint read failed; rendering instead (${(error as Error).message})`);
+        return undefined;
+      }
+    },
   };
 }
 
@@ -359,6 +420,59 @@ function valueTags(value: IncrementalCacheValue | null): string[] {
   const header = headers?.['x-next-cache-tags'];
   if (typeof header === 'string') return header.split(',');
   return [];
+}
+
+/**
+ * ETag of an incremental value's etag-able payload, mirroring next's
+ * `generateETag(payload)` (FNV-1a over the response text, `lib/etag.js`) so
+ * published fingerprints match what `sendRenderResult` computes for the same
+ * bytes. Returns undefined when the kind has no single HTML payload
+ * (FETCH, APP_ROUTE) or the html field is absent/not a string.
+ */
+function valueEtag(value: IncrementalCacheValue): string | undefined {
+  if (value.kind !== 'APP_PAGE' && value.kind !== 'PAGES') return undefined;
+  if (!('html' in value)) return undefined;
+  const html: unknown = value.html;
+  if (typeof html !== 'string') return undefined;
+  return generateETag(html);
+}
+
+/**
+ * Extract the URL path from a route-cache storage key:
+ * `/route-cache/APP_PAGE/<sha256(owner)>/$/<normalized-path>` →
+ * `/<normalized-path>`. Returns undefined for unexpected shapes.
+ */
+function routeFromCacheKey(cacheKey: string): string | undefined {
+  const marker = '/$/';
+  const at = cacheKey.lastIndexOf(marker);
+  if (at === -1) return undefined;
+  const normalized = cacheKey.slice(at + marker.length);
+  return normalized.startsWith('/') ? normalized : `/${normalized}`;
+}
+
+/** FNV-1a (52-bit), ported from next's `lib/etag.js` — identical output. */
+function generateETag(payload: string): string {
+  let v0 = 0x2325;
+  let v1 = 0x8422;
+  let v2 = 0x9ce4;
+  let v3 = 0xcbf2;
+  for (let i = 0; i < payload.length; ) {
+    v0 ^= payload.charCodeAt(i++);
+    const t0 = v0 * 435;
+    let t1 = v1 * 435;
+    let t2 = v2 * 435;
+    let t3 = v3 * 435;
+    t2 += v0 << 8;
+    t3 += v1 << 8;
+    t1 += t0 >>> 16;
+    v0 = t0 & 65535;
+    t2 += t1 >>> 16;
+    v1 = t1 & 65535;
+    v3 = (t3 + (t2 >>> 16)) & 65535;
+    v2 = t2 & 65535;
+  }
+  const folded = (v3 & 15) * 281474976710656 + v2 * 4294967296 + v1 * 65536 + (v0 ^ (v3 >>> 4));
+  return `"${folded.toString(36)}${payload.length.toString(36)}"`;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -571,7 +685,7 @@ export function createIncrementalCacheHandler(
     async set(
       cacheKey: string,
       data: IncrementalCacheValue | null,
-      _ctx: IncrementalCacheContext,
+      ctx: IncrementalCacheContext,
     ) {
       const key = opts.prefix + cacheKey;
       // A null datum means "delete this key" (Next uses it to drop entries).
@@ -584,6 +698,33 @@ export function createIncrementalCacheHandler(
       // reference — exactly like Next's own in-memory `FileSystemCache`. Only
       // invalidation is shared; the entry itself never leaves this process.
       remember(entries, key, { lastModified: now(), value: data }, opts.maxEntries);
+
+      // Publish a route fingerprint for fully-static HTML pages, so sibling
+      // pods' middleware can answer conditional (If-None-Match) requests with
+      // 304 without rendering. Generation = the route soft-tag stamp as of
+      // THIS render; a later revalidation bumps the soft-tag stamp and
+      // instantly supersedes this row (resolveConditional requires
+      // generation >= current). Only APP_PAGE (one response per route);
+      // FETCH/APP_ROUTE segment maps have no single etag-able payload.
+      //
+      // Route path: Next strips `ctx.route` for non-FETCH kinds before calling
+      // us (IncrementalCache.set), but the storage key it hands us embeds the
+      // owner hash and the normalized page path:
+      //   /route-cache/APP_PAGE/<sha256(sourceRoute)>/$/<normalized-path>
+      // The trailing segment is the URL path — use it for the fingerprint.
+      if (data.kind === 'APP_PAGE') {
+        const etag = valueEtag(data);
+        if (etag) {
+          // Next treats `/` and `/index` as the same route (implicit-tags
+          // aliasing); normalize so middleware lookups for `/` find the row
+          // and the soft-tag generation reads the same stamp revalidateTag
+          // bumps (`_N_T_/`).
+          const path = (ctx.route ?? routeFromCacheKey(cacheKey))?.replace(/\/index$/, '/') || '/';
+          const softTag = `_N_T_${path}`;
+          await store.sync();
+          await store.publishFingerprint(path, store.stamps.get(softTag) ?? 0, etag);
+        }
+      }
     }
 
     async revalidateTag(tags: string | string[], _durations?: { expire?: number }) {
@@ -625,6 +766,73 @@ async function drainStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
     offset += chunk.byteLength;
   }
   return bytes;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Conditional-request (304) answering from shared fingerprints.                *
+ * ------------------------------------------------------------------------- */
+
+/** Options shared by every public entry point. */
+export interface FingerprintOptions extends CacheplankOptions {}
+
+/**
+ * Decide a conditional request from the shared fingerprint table.
+ *
+ * Returns `304` when a pod has already rendered the *current generation* of
+ * `pathname` and its published ETag equals `ifNoneMatch` — the caller (Next
+ * middleware) may then answer `new NextResponse(null, { status: 304 })`
+ * without rendering. Any other case returns `null`: render as usual.
+ *
+ * Safety rule baked in: the fingerprint's generation must be ≥ the route's
+ * current generation (the `_N_T_<path>` stamp as seen through the same
+ * sync'd memo the cache handlers use), and the row must be inside the
+ * retention window. A revalidation bumps the stamp and instantly retires the
+ * old fingerprint fleet-wide.
+ */
+export async function resolveConditional(
+  pathname: string,
+  ifNoneMatch: string | undefined,
+  options: FingerprintOptions = {},
+): Promise<304 | null> {
+  if (!ifNoneMatch) return null;
+  const resolved = resolveOptions(options);
+  const store = createStampStore(resolved);
+  await store.sync();
+  const generation = store.stamps.get(`_N_T_${pathname}`) ?? 0;
+  const etag = await store.fingerprint(pathname, generation);
+  return etag !== undefined && etag === ifNoneMatch ? 304 : null;
+}
+
+/**
+ * Next middleware wrapper answering conditional requests from shared
+ * fingerprints. Install in `middleware.ts`:
+ *
+ *   import { withConditional304 } from 'cacheplank/middleware';
+ *   export const middleware = withConditional304();
+ *   export const config = { matcher: ['/:path*'] };
+ *
+ * Only GET/HEAD requests carrying `If-None-Match` consult the table (one
+ * memoized lookup via the same single-flight sync); everything else passes
+ * straight through. Fail-open: any store error → render as usual.
+ */
+export function withConditional304(options: FingerprintOptions = {}) {
+  return async function middleware(request: Request): Promise<Response> {
+    const ifNoneMatch = request.headers.get('if-none-match') ?? undefined;
+    if (ifNoneMatch && (request.method === 'GET' || request.method === 'HEAD')) {
+      const pathname = new URL(request.url).pathname;
+      const verdict = await resolveConditional(pathname, ifNoneMatch, options);
+      if (verdict === 304) {
+        return new Response(null, { status: 304 });
+      }
+    }
+    // Neutral pass-through: let the request continue to the app. Returning a
+    // plain 200 with no body rewrites nothing — Next middleware treats a
+    // missing `x-middleware-next` header as "continue" only for its own
+    // Response shape, so we use the official escape hatch instead.
+    const headers = new Headers();
+    headers.set('x-middleware-next', '1');
+    return new Response(null, { status: 200, headers });
+  };
 }
 
 /**
